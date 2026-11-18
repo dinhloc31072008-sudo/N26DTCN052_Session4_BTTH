@@ -1,0 +1,146 @@
+BÁO CÁO THIẾT KẾ: Hệ thống tự động xử lý đơn hàng qua tin nhắn
+1. Bài toán và mục tiêu
+
+Cửa hàng thời trang online nhận đơn qua Messenger/Zalo. Tin nhắn viết tắt, thiếu thông tin hoặc đặt món hết hàng. Cần một hệ thống tự động: hiểu tin nhắn → kiểm tra logic, tính tiền → phản hồi khách, và không bao giờ crash hay tự bịa số liệu khi dữ liệu dị biệt.
+
+2. Kiến trúc chuỗi
+Tin nhắn ──► [P1 Trích xuất] ──► [Cổng 1] ──► [P2 Kiểm tra + CoT] ──► [Cổng 2] ──► [P3 Phản hồi] ──► Khách
+                                    │ lỗi                               │ lỗi
+                                    └────────► Nhánh lỗi: HANDOFF_STAFF (chuyển nhân viên) ◄──┘
+Bước	Kỹ thuật	Input	Output
+P1	Few-shot, ràng buộc “không bịa”	Tin nhắn thô	JSON: items, phone, address, voucher, missing_fields, status
+Cổng 1	Code (không tốn token)	JSON P1	Hợp lệ → P2; sai cấu trúc → thử lại 1 lần, vẫn sai → nhân viên
+P2	Chain-of-Thought 6 bước	JSON P1 + dữ liệu shop	JSON: reasoning_steps, valid_items, out_of_stock, subtotal, discount, shipping, total, status
+Cổng 2	Code kiểm tra lại phép tính	JSON P2	total khớp công thức → P3; lệch → nhân viên
+P3	Rẽ nhánh theo status	JSON P2	{message, action}
+3. Cơ chế xử lý đứt gãy và dữ liệu dị biệt
+Tình huống	Cách xử lý
+SĐT thiếu hoặc sai số	P1 để null, ghi vào missing_fields; P3 hỏi lại
+Địa chỉ không đủ	Tương tự, và shipping = null (không đoán phí ship)
+Hết hàng, size không tồn tại	P2 đưa vào out_of_stock, không tính tiền; P3 gợi ý size còn
+Voucher sai, hết hạn	discount = 0 kèm lý do
+Số lượng mơ hồ (“vài cái”)	qty = null, hỏi lại
+Tin nhắn không phải đặt hàng	NOT_AN_ORDER, không chạy P2, P3
+AI trả JSON hỏng hoặc có chữ thừa	Code bóc JSON, thử lại 1 lần, vẫn lỗi → nhân viên
+Phép tính của AI sai	Cổng 2 tính lại bằng code, lệch → nhân viên
+Lỗi API, timeout	try/except, chuyển nhân viên
+
+Tối ưu token: (1) chỉ truyền JSON gọn giữa các bước, không truyền cả hội thoại; (2) dùng mô hình nhỏ cho P1, P3, mô hình mạnh cho P2; (3) cổng kiểm tra viết bằng code, không gọi AI; (4) P3 giới hạn 80 từ.
+
+4. Prompt hệ thống
+
+Prompt chung (system):
+
+Bạn là thành phần trong hệ thống xử lý đơn hàng. Chỉ dùng thông tin được cung cấp.
+Thiếu dữ liệu → null, tuyệt đối không suy đoán. Chỉ trả JSON thuần, không markdown, không giải thích.
+
+P1: Trích xuất
+
+Trích xuất đơn hàng từ <tin_nhan>.
+Ví dụ: "lấy 1 áo L, giao 12 Lê Lợi Q1, 0912345678"
+→ {"items":[{"product":"áo","size":"L","qty":1}],"phone":"0912345678","address":"12 Lê Lợi, Q1","voucher":null,"missing_fields":[],"status":"OK"}
+Quy tắc:
+- Trường không có → null, ghi tên trường vào missing_fields.
+- SĐT không đủ 10 số → null + missing. Địa chỉ thiếu số nhà hoặc đường → missing.
+- Số lượng mơ hồ → qty=null + missing.
+- Không phải đặt hàng → status="NOT_AN_ORDER", các trường khác null.
+- status="OK" nếu missing_fields rỗng, ngược lại "INCOMPLETE".
+Schema: {"items":[],"phone":null,"address":null,"voucher":null,"missing_fields":[],"status":""}
+<tin_nhan>{{TIN_NHAN}}</tin_nhan>
+
+P2: Kiểm tra logic (CoT)
+
+Kiểm tra tồn kho và tính tiền cho <don_hang> theo <du_lieu_shop>. Suy luận từng bước, ghi vào reasoning_steps:
+B1 Khớp mã sản phẩm (không khớp → status "UNKNOWN_PRODUCT").
+B2 So qty với tồn kho theo size; thiếu → out_of_stock, không tính tiền món đó.
+B3 subtotal = tổng (giá × qty) các món còn hàng.
+B4 Kiểm tra voucher (hạn, điều kiện tối thiểu); sai → discount=0 + ghi lý do.
+B5 Ship theo khu vực; freeship nếu sau giảm ≥ 500.000đ; địa chỉ null → shipping=null.
+B6 total = subtotal − discount + shipping (null nếu shipping null); tính lại một lần.
+status: "OK" | "NEEDS_CLARIFICATION" (thiếu thông tin hoặc hết hàng) | "ERROR".
+Schema: {"reasoning_steps":[],"valid_items":[],"out_of_stock":[],"subtotal":0,"discount":0,"shipping":null,"total":null,"status":""}
+<du_lieu_shop>{{DU_LIEU_SHOP}}</du_lieu_shop>
+<don_hang>{{JSON_P1}}</don_hang>
+
+P3: Phản hồi
+
+Bạn là CSKH thân thiện, xưng "shop", gọi khách "bạn". Dựa vào <ket_qua>:
+- OK → xác nhận món và tổng tiền, action="CONFIRM_ORDER".
+- NEEDS_CLARIFICATION → nêu món hết hàng (gợi ý size còn), liệt kê chính xác thông tin còn thiếu, action="ASK_CUSTOMER".
+- ERROR hoặc UNKNOWN_PRODUCT → xin lỗi ngắn, action="HANDOFF_STAFF".
+Chỉ dùng số liệu trong <ket_qua>. Tối đa 80 từ, tối đa 1 emoji.
+Schema: {"message":"","action":""}
+<ket_qua>{{JSON_P2}}</ket_qua>
+5. Code điều phối (Python, rút gọn)
+python
+import json, re
+
+HANDOFF = {"message": "Shop xin lỗi, nhân viên sẽ liên hệ bạn ngay ạ.", "action": "HANDOFF_STAFF"}
+
+def parse_json(text):
+    """Bóc JSON đầu tiên trong phản hồi AI; trả None nếu hỏng."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    try:
+        return json.loads(m.group()) if m else None
+    except json.JSONDecodeError:
+        return None
+
+def call_step(prompt, required_keys, retries=1):
+    """Gọi AI, kiểm tra cấu trúc, thử lại khi lỗi."""
+    for _ in range(retries + 1):
+        try:
+            data = parse_json(call_llm(prompt))   # call_llm: hàm gọi API của bạn
+        except Exception:                          # timeout, lỗi mạng
+            data = None
+        if data and all(k in data for k in required_keys):
+            return data
+    return None
+
+def check_total(p2):
+    """Cổng 2: tính lại bằng code, không tin hoàn toàn vào AI."""
+    if p2.get("total") is None:
+        return True
+    return p2["total"] == p2["subtotal"] - p2["discount"] + (p2["shipping"] or 0)
+
+def process_order(message, shop_data):
+    p1 = call_step(P1.format(TIN_NHAN=message), ["items", "status"])
+    if not p1:
+        return HANDOFF
+    if p1["status"] == "NOT_AN_ORDER":
+        return {"message": "Bạn cần shop hỗ trợ gì ạ?", "action": "ASK_CUSTOMER"}
+
+    p2 = call_step(P2.format(DU_LIEU_SHOP=shop_data, JSON_P1=json.dumps(p1, ensure_ascii=False)),
+                   ["subtotal", "discount", "total", "status"])
+    if not p2 or not check_total(p2):
+        return HANDOFF
+
+    p3 = call_step(P3.format(JSON_P2=json.dumps(p2, ensure_ascii=False)), ["message", "action"])
+    return p3 or HANDOFF
+
+call_llm, P1, P2, P3 bạn thay bằng hàm gọi API và chuỗi prompt ở mục 4. Mọi nhánh lỗi đều kết thúc bằng HANDOFF, không có chỗ nào để chương trình bị crash.
+
+6. Kết quả chạy thử
+
+Dữ liệu shop: AT01 áo thun 150.000đ (S=5, M=0, L=10); QJ02 quần jeans 350.000đ (29=3, 30=2, 31=0); GIAM10 giảm 10% đơn từ 300.000đ, hạn 30/11/2026; ship HCM 20.000đ, tỉnh 35.000đ, freeship từ 500.000đ.
+
+Test 1, đơn nhiều bẫy: “Shop ơi, lấy cho mình 2 áo thun basic size M với 1 quần jeans size 30 nha. Mình có mã GIAM10. Gửi về Q.7. SĐT mình 0901 234 xx”
+
+P1: status="INCOMPLETE", missing_fields=["phone","address"].
+P2: AT01 size M hết hàng; subtotal 350.000, discount 35.000, shipping=null, total=null, status="NEEDS_CLARIFICATION".
+Cổng 2: hợp lệ (total null).
+P3:
+json
+{"message":"Chào bạn! Áo thun basic size M hiện đã hết, shop còn size S và L, bạn muốn đổi size nào ạ? Quần jeans size 30 còn hàng, mã GIAM10 giảm được 35.000đ. Bạn gửi giúp shop SĐT đủ 10 số và địa chỉ giao hàng (số nhà, đường, phường, Q.7) để shop chốt đơn nhé!","action":"ASK_CUSTOMER"}
+
+Test 2, đơn sạch: “Lấy 1 áo thun basic size L, giao 25 Nguyễn Huệ, Q1, TP.HCM, SĐT 0912345678”
+
+P1: status="OK". P2: subtotal 150.000, discount 0, shipping 20.000, total 170.000, status="OK".
+Cổng 2: 150.000 − 0 + 20.000 = 170.000, khớp.
+P3:
+json
+{"message":"Shop xác nhận đơn: 1 áo thun basic size L, tổng 170.000đ (gồm ship 20.000đ), giao về 25 Nguyễn Huệ, Q1. Cảm ơn bạn!","action":"CONFIRM_ORDER"}
+
+Test 3, dữ liệu dị biệt: “Hôm nay trời đẹp quá shop nhỉ”
+
+P1: status="NOT_AN_ORDER" → hệ thống dừng ở bước này, không gọi P2, P3, không tốn token thêm.
+Kết quả: {"message":"Bạn cần shop hỗ trợ gì ạ?","action":"ASK_CUSTOMER"}
